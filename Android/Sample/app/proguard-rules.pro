@@ -16,12 +16,5 @@
 #   public *;
 #}
 
-# Support Libraries
--dontwarn android.support.**
--keep class android.support.** { *; }
--keep interface android.support.** { *; }
-
-# Small
--keep class net.wequick.small.Small { public *; }
--keep class net.wequick.small.Bundle { public *; }
--keep interface net.wequick.small.** { *; }
+-renamesourcefileattribute SourceFile
+-keepattributes SourceFile,LineNumberTable

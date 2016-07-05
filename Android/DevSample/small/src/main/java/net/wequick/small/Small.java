@@ -25,6 +25,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.net.Uri;
 
 import net.wequick.small.util.ApplicationUtils;
@@ -32,7 +33,8 @@ import net.wequick.small.webkit.JsHandler;
 import net.wequick.small.webkit.WebView;
 import net.wequick.small.webkit.WebViewClient;
 
-import java.io.File;
+import org.json.JSONObject;
+
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -61,16 +63,18 @@ public final class Small {
     private static final String SHARED_PREFERENCES_BUNDLE_MODIFIES = "small.app-modifies";
     private static final String SHARED_PREFERENCES_BUNDLE_UPGRADES = "small.app-upgrades";
 
-    private static Context sContext = null;
+    private static Application sContext = null;
     private static String sBaseUri = ""; // base url of uri
     private static boolean sIsNewHostApp; // first launched or upgraded
     private static int sWebActivityTheme;
+
+    private static byte[][] sHostCertificates;
 
     public interface OnCompleteListener {
         void onComplete();
     }
 
-    public static Context getContext() {
+    public static Application getContext() {
         return sContext;
     }
 
@@ -84,6 +88,10 @@ public final class Small {
 
     public static boolean getIsNewHostApp() {
         return sIsNewHostApp;
+    }
+
+    public static byte[][] getHostCertificates() {
+        return sHostCertificates;
     }
 
     public static void preSetUp(Application context) {
@@ -114,6 +122,21 @@ public final class Small {
             sIsNewHostApp = false;
         }
 
+        // Collect host certificates
+        try {
+            Signature[] ss = pm.getPackageInfo(Small.getContext().getPackageName(),
+                    PackageManager.GET_SIGNATURES).signatures;
+            if (ss != null) {
+                int N = ss.length;
+                sHostCertificates = new byte[N][];
+                for (int i = 0; i < N; i++) {
+                    sHostCertificates[i] = ss[i].toByteArray();
+                }
+            }
+        } catch (PackageManager.NameNotFoundException ignored) {
+
+        }
+
         // Check if application is started after unexpected exit (killed in background etc.)
         ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
         ComponentName launchingComponent = am.getRunningTasks(1).get(0).topActivity;
@@ -139,12 +162,20 @@ public final class Small {
         return Bundle.findByName(bundleName);
     }
 
+    public static boolean updateManifest(JSONObject manifest, boolean force) {
+        return Bundle.updateManifest(manifest, force);
+    }
+
     public static void setWebViewClient(WebViewClient client) {
         WebView.setWebViewClient(client);
     }
 
     public static void registerJsHandler(String method, JsHandler handler) {
         WebView.registerJsHandler(method, handler);
+    }
+
+    public static SharedPreferences getSharedPreferences() {
+        return getContext().getSharedPreferences(SHARED_PREFERENCES_SMALL, 0);
     }
 
     public static Map<String, Integer> getBundleVersions() {
@@ -200,6 +231,19 @@ public final class Small {
                 getSharedPreferences(SHARED_PREFERENCES_BUNDLE_UPGRADES, 0);
         if (sp == null) return false;
         return sp.getBoolean(bundleName, false);
+    }
+
+    public static boolean isUpgrading() {
+        SharedPreferences sp = getContext().
+                getSharedPreferences(SHARED_PREFERENCES_BUNDLE_UPGRADES, 0);
+        Map<String, Boolean> flags = (Map<String, Boolean>) sp.getAll();
+        if (flags == null) return false;
+        Iterator<Map.Entry<String, Boolean>> it = flags.entrySet().iterator();
+        while (it.hasNext()) {
+            Boolean flag = it.next().getValue();
+            if (flag != null && flag) return true;
+        }
+        return false;
     }
 
     public static void openUri(String uriString, Context context) {

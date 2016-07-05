@@ -1,10 +1,10 @@
-package net.wequick.small.util;
+package net.wequick.small;
 
+import android.content.Context;
 import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
-import android.content.pm.Signature;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.content.res.TypedArray;
@@ -12,26 +12,31 @@ import android.content.res.XmlResourceParser;
 import android.os.PatternMatcher;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.util.SparseIntArray;
 import android.util.TypedValue;
 
-import net.wequick.small.Small;
+import net.wequick.small.util.JNIUtils;
+import net.wequick.small.util.ReflectAccelerator;
 
 import org.xmlpull.v1.XmlPullParserException;
 
 import java.io.BufferedInputStream;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.lang.ref.WeakReference;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateEncodingException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Enumeration;
-import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.zip.ZipFile;
 
 /**
  * This class consists exclusively of methods that operate on external bundle.
@@ -65,7 +70,7 @@ public class BundleParser {
                     0x01010000, 0x01010001, 0x01010003
             };
             public static int AndroidManifestApplication_theme = 0;
-            public static int AndroidManifestApplication_label = 1; // for ABIs
+            public static int AndroidManifestApplication_label = 1; // for ABIs (Depreciated)
             public static int AndroidManifestApplication_name = 2;
             // activity
             public static int[] AndroidManifestActivity = {
@@ -101,11 +106,16 @@ public class BundleParser {
     private XmlResourceParser parser;
     private Resources res;
     private ConcurrentHashMap<String, List<IntentFilter>> mIntentFilters;
-    private int mABIFlags;
+    private boolean mNonResources;
+    private String mLibDir;
+
+    private Context mContext;
+    private ZipFile mZipFile;
 
     public BundleParser(File sourceFile, String packageName) {
         mArchiveSourcePath = sourceFile.getPath();
         mPackageName = packageName;
+        mContext = Small.getContext();
     }
 
     public static BundleParser parsePackage(File sourceFile, String packageName) {
@@ -122,6 +132,8 @@ public class BundleParser {
         boolean assetError = true;
         try {
             assmgr = ReflectAccelerator.newAssetManager();
+            if (assmgr == null) return false;
+
             int cookie = ReflectAccelerator.addAssetPath(assmgr, mArchiveSourcePath);
             if(cookie != 0) {
                 parser = assmgr.openXmlResourceParser(cookie, "AndroidManifest.xml");
@@ -138,7 +150,7 @@ public class BundleParser {
             return false;
         }
 
-        res = new Resources(assmgr, Small.getContext().getResources().getDisplayMetrics(), null);
+        res = new Resources(assmgr, mContext.getResources().getDisplayMetrics(), null);
         return parsePackage(res, parser);
     }
 
@@ -153,6 +165,21 @@ public class BundleParser {
 
             // <manifest ...
             mPackageInfo.packageName = parser.getAttributeValue(null, "package").intern();
+
+            // After gradle-small 0.9.0, we roll out
+            // `The Small exclusive flags`
+            //  F    F    F    F    F    F    F    F
+            // 1111 1111 1111 1111 1111 1111 1111 1111
+            // ^^^^ ^^^^ ^^^^ ^^^^ ^^^^
+            //       ABI Flags (20)
+            //                          ^
+            //                 nonResources Flag (1)
+            //                           ^^^ ^^^^ ^^^^
+            //                     platformBuildVersionCode (11) => MAX=0x7FF=4095
+            int flags = parser.getAttributeIntValue(null, "platformBuildVersionCode", 0);
+            int abiFlags = (flags & 0xFFFFF000) >> 12;
+            mNonResources = (flags & 0x800) != 0;
+
             TypedArray sa = res.obtainAttributes(attrs,
                     R.styleable.AndroidManifest);
             mPackageInfo.versionCode = sa.getInteger(
@@ -185,13 +212,21 @@ public class BundleParser {
                         app.className = null;
                     }
 
-                    // Get the label value which used as ABI flags
-                    TypedValue label = new TypedValue();
-                    if (sa.getValue(R.styleable.AndroidManifestApplication_label, label)) {
-                        if (label.type == TypedValue.TYPE_STRING) {
-                            mABIFlags = Integer.parseInt(label.string.toString());
-                        } else {
-                            mABIFlags = label.data;
+                    // Get the label value which used as ABI flags.
+                    // This is depreciated, we read it from the `platformBuildVersionCode` instead.
+                    // TODO: Remove this if the gradle-small 0.9.0 or above being widely used.
+                    if (abiFlags == 0) {
+                        TypedValue label = new TypedValue();
+                        if (sa.getValue(R.styleable.AndroidManifestApplication_label, label)) {
+                            if (label.type == TypedValue.TYPE_STRING) {
+                                abiFlags = Integer.parseInt(label.string.toString());
+                            } else {
+                                abiFlags = label.data;
+                            }
+                        }
+                        if (abiFlags != 0) {
+                            throw new RuntimeException("Please recompile " + mPackageName
+                                    + " use gradle-small 0.9.0 or above");
                         }
                     }
 
@@ -202,8 +237,14 @@ public class BundleParser {
                 }
             }
 
+            if (abiFlags != 0) {
+                String abi = JNIUtils.getExtractABI(abiFlags, Bundle.is64bit());
+                if (abi != null) {
+                    mLibDir = "lib/" + abi + "/";
+                }
+            }
+
             sa.recycle();
-            collectCertificates();
             return true;
         } catch (XmlPullParserException e) {
             e.printStackTrace();
@@ -300,7 +341,7 @@ public class BundleParser {
         return false;
     }
 
-    public boolean collectCertificates() {
+    public boolean verifyAndExtract(Bundle bundle, BundleExtractor extractor) {
         WeakReference<byte[]> readBufferRef;
         byte[] readBuffer = null;
         synchronized (this.getClass()) {
@@ -315,71 +356,83 @@ public class BundleParser {
             }
         }
 
+        byte[][] hostCerts = Small.getHostCertificates();
+        CrcVerifier crcVerifier = new CrcVerifier(mContext, bundle.getPackageName(), hostCerts);
+
         try {
             JarFile jarFile = new JarFile(mArchiveSourcePath);
-
-            Certificate[] certs = null;
-
 
             Enumeration entries = jarFile.entries();
             while (entries.hasMoreElements()) {
                 JarEntry je = (JarEntry)entries.nextElement();
                 if (je.isDirectory()) continue;
-                if (je.getName().startsWith("META-INF/")) continue;
+
+                String name = je.getName();
+                if (name.startsWith("META-INF/")) continue;
+
+                if (mLibDir != null && name.startsWith("lib/") && !name.startsWith(mLibDir)) {
+                    // Ignore unused ABIs
+                    continue;
+                }
+
+                // Verify CRC first
+                int hash = name.hashCode();
+                int crc = crcVerifier.getObscuredCrc(je.getCrc());
+                if (crcVerifier.verifyCrc(hash, crc)) {
+                    continue;
+                }
+
+                // Verify certificates
                 Certificate[] localCerts = loadCertificates(jarFile, je,
                         readBuffer);
-                if (false) {
-                    Log.i(TAG, "File " + mArchiveSourcePath + " entry " + je.getName()
-                            + ": certs=" + certs + " ("
-                            + (certs != null ? certs.length : 0) + ")");
-                }
+
                 if (localCerts == null) {
                     Log.e(TAG, "Package " + mPackageName
                             + " has no certificates at entry "
-                            + je.getName() + "; ignoring!");
+                            + name + "; ignoring!");
+                    crcVerifier.close();
                     jarFile.close();
                     return false;
-                } else if (certs == null) {
-                    certs = localCerts;
                 } else {
                     // Ensure all certificates match.
-                    for (int i=0; i<certs.length; i++) {
+                    for (int i=0; i<hostCerts.length; i++) {
                         boolean found = false;
                         for (int j=0; j<localCerts.length; j++) {
-                            if (certs[i] != null &&
-                                    certs[i].equals(localCerts[j])) {
+                            if (hostCerts[i] != null &&
+                                    Arrays.equals(hostCerts[i], localCerts[j].getEncoded())) {
                                 found = true;
                                 break;
                             }
                         }
-                        if (!found || certs.length != localCerts.length) {
+                        if (!found || hostCerts.length != localCerts.length) {
                             Log.e(TAG, "Package " + mPackageName
                                     + " has mismatched certificates at entry "
-                                    + je.getName() + "; ignoring!");
+                                    + name + "; ignoring!");
+                            crcVerifier.close();
                             jarFile.close();
                             return false;
                         }
                     }
                 }
+
+                // Extract file if needed
+                File extractFile = extractor.getExtractFile(bundle, name);
+                if (extractFile != null) {
+                    if (mZipFile == null) {
+                        mZipFile = new ZipFile(mArchiveSourcePath);
+                    }
+                    postExtractFile(mZipFile, je, extractFile);
+                }
+
+                // Record the new crc
+                crcVerifier.recordCrc(hash, crc);
             }
 
+            postSaveCrcs(crcVerifier);
             jarFile.close();
 
             synchronized (this.getClass()) {
                 mReadBuffer = readBufferRef;
-            }
-
-            if (certs != null && certs.length > 0) {
-                final int N = certs.length;
-                mPackageInfo.signatures = new Signature[certs.length];
-                for (int i=0; i<N; i++) {
-                    mPackageInfo.signatures[i] = new Signature(
-                            certs[i].getEncoded());
-                }
-            } else {
-                Log.e(TAG, "Package " + mPackageName
-                        + " has no certificates; ignoring!");
-                return false;
             }
         } catch (CertificateEncodingException e) {
             Log.w(TAG, "Exception reading " + mArchiveSourcePath, e);
@@ -392,6 +445,52 @@ public class BundleParser {
             return false;
         }
         return true;
+    }
+
+    private void postSaveCrcs(final CrcVerifier crcVerifier) {
+        Bundle.postIO(new Runnable() {
+            @Override
+            public void run() {
+                crcVerifier.saveCrcs();
+            }
+        });
+    }
+
+    private void postExtractFile(final ZipFile zipFile, final JarEntry je, final File extractFile) {
+        Bundle.postIO(new Runnable() {
+            @Override
+            public void run() {
+                RandomAccessFile out = null;
+                try {
+                    File dir = extractFile.getParentFile();
+                    if (!dir.exists()) {
+                        dir.mkdirs();
+                    }
+                    if (!extractFile.exists()) {
+                        if (!extractFile.createNewFile()) {
+                            throw new RuntimeException("Failed to create file: " + extractFile);
+                        }
+                    }
+                    InputStream is = zipFile.getInputStream(je);
+                    out = new RandomAccessFile(extractFile, "rw");
+                    byte[] buffer = new byte[8192];
+                    int len;
+                    while ((len = is.read(buffer, 0, buffer.length)) != -1) {
+                        out.write(buffer, 0, len);
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } finally {
+                    if (out != null) {
+                        try {
+                            out.close();
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+            }
+        });
     }
 
 
@@ -554,7 +653,198 @@ public class BundleParser {
         return mIntentFilters;
     }
 
-    public int getABIFlags() {
-        return mABIFlags;
+    public String getLibraryDirectory() {
+        return mLibDir;
+    }
+
+    /**
+     * This method tells whether the bundle has `resources.arsc` entry, note that
+     * it doesn't make sense until your bundle was built by `gradle-small` 0.9.0 or above.
+     * @return <tt>true</tt> if doesn't have any resources
+     */
+    public boolean isNonResources() {
+        return mNonResources;
+    }
+
+    protected void close() {
+        if (mZipFile != null) {
+            try {
+                mZipFile.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        mReadBuffer = null;
+    }
+
+    /**
+     * Class to verify and save the crc of each bundle entry.
+     * The SCRC (Small CRC) file format:
+     * +--------------+
+     * | Magic Number | 5343 5243
+     * | Entry Count  |
+     * | Entry #1     | each entry follows hash(int) and crc(int)
+     * | Entry ...    |
+     * | Entry #N     |
+     * +--------------+
+     */
+    private static final class CrcVerifier {
+
+        private static final String CRC_EXTENSION = ".scrc";
+        private static final byte[] MAGIC_NUMBER = new byte[]{ 0x53, 0x43, 0x52, 0x43 }; // SCRC
+        private static final int HEADER_SIZE = 8;
+        private static final int ENTRY_SIZE = 8;
+        private static final int CRC_OFFSET = 4;
+
+        private RandomAccessFile mCrcFile;
+        private int mSavedCrcCount;
+        private SparseIntArray mSavedCrcs;
+        private SparseIntArray mSavedCrcIndexes;
+        private SparseIntArray mVerifiedCrcs;
+        private SparseIntArray mUpdatedCrcs;
+        private SparseIntArray mInsertedCrcs;
+        private SparseIntArray mDeletedCrcIndexes;
+        private int mObscureOffset;
+
+        CrcVerifier(Context context, String packageName, byte[][] certs) {
+            try {
+                File crcPath = context.getFileStreamPath(CRC_EXTENSION);
+                if (!crcPath.exists()) {
+                    crcPath.mkdir();
+                }
+                File crcFile = new File(crcPath, packageName + CRC_EXTENSION);
+                boolean exists = crcFile.exists();
+                if (!exists) {
+                    crcFile.createNewFile();
+                }
+
+                // Initialize certs
+                mObscureOffset = Arrays.hashCode(certs[0]);
+
+                // Parse the file
+                mCrcFile = new RandomAccessFile(crcFile, "rw");
+                if (exists) {
+                    byte[] magic = new byte[MAGIC_NUMBER.length];
+                    mCrcFile.read(magic);
+                    if (!Arrays.equals(magic, MAGIC_NUMBER)) {
+                        return;
+                    }
+
+                    mSavedCrcCount = mCrcFile.readInt();
+                    if (mSavedCrcCount == 0) return;
+
+                    mSavedCrcs = new SparseIntArray(mSavedCrcCount);
+                    mSavedCrcIndexes = new SparseIntArray(mSavedCrcCount);
+                    mDeletedCrcIndexes = new SparseIntArray(mSavedCrcCount);
+                    for (int i = 0; i < mSavedCrcCount; i++) {
+                        int hash = mCrcFile.readInt();
+                        int crc = mCrcFile.readInt();
+                        mSavedCrcs.put(hash, crc);
+                        mSavedCrcIndexes.put(hash, i);
+                        mDeletedCrcIndexes.put(hash, i);
+                    }
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        private boolean verifyCrc(int hash, int crc) {
+            int savedCrc = (mSavedCrcs == null) ? 0 : mSavedCrcs.get(hash);
+            // Record the current crc
+            if (mVerifiedCrcs == null) {
+                mVerifiedCrcs = new SparseIntArray();
+            }
+            mVerifiedCrcs.put(hash, crc);
+            return (savedCrc == crc);
+        }
+
+        private void recordCrc(int hash, int crc) {
+            int savedIndex = -1;
+            if (mSavedCrcIndexes != null) {
+                savedIndex = mSavedCrcIndexes.get(hash, -1);
+            }
+            if (savedIndex >= 0) {
+                // If we had saved, update it
+                if (mUpdatedCrcs == null) {
+                    mUpdatedCrcs = new SparseIntArray();
+                }
+                mUpdatedCrcs.put(savedIndex, crc);
+            } else {
+                // Otherwise, insert a new one
+                if (mInsertedCrcs == null) {
+                    mInsertedCrcs = new SparseIntArray();
+                }
+                mInsertedCrcs.put(hash, crc);
+            }
+        }
+
+        private void saveCrcs() {
+            if (mVerifiedCrcs == null) return;
+
+            try {
+                int i;
+                int N = mVerifiedCrcs.size();
+                if (mSavedCrcs == null || mSavedCrcs.size() > N) {
+                    // If first created or something deleted, we should rewrite all the data
+                    if (mSavedCrcs == null) {
+                        mCrcFile.seek(0);
+                        mCrcFile.write(MAGIC_NUMBER);
+                    } else {
+                        mCrcFile.seek(MAGIC_NUMBER.length);
+                    }
+                    mCrcFile.writeInt(N);
+                    for (i = 0; i < N; i++) {
+                        mCrcFile.writeInt(mVerifiedCrcs.keyAt(i));
+                        mCrcFile.writeInt(mVerifiedCrcs.valueAt(i));
+                    }
+                    mCrcFile.setLength(HEADER_SIZE + N * ENTRY_SIZE);
+                } else {
+                    // Otherwise, we can update the crc in specify offset faster
+                    if (mUpdatedCrcs != null) {
+                        N = mUpdatedCrcs.size();
+                        for (i = 0; i < N; i++) {
+                            int offset = mUpdatedCrcs.keyAt(i);
+                            int crc = mUpdatedCrcs.valueAt(i);
+                            mCrcFile.seek(HEADER_SIZE + offset * ENTRY_SIZE + CRC_OFFSET);
+                            mCrcFile.writeInt(crc);
+                        }
+                    }
+                    if (mInsertedCrcs != null) {
+                        N = mInsertedCrcs.size();
+                        mCrcFile.seek(MAGIC_NUMBER.length);
+                        mCrcFile.writeInt(mSavedCrcCount + N); // update the entry size
+
+                        long len = mCrcFile.length();
+                        mCrcFile.seek(len);
+                        long addedSize = 0;
+                        for (i = 0; i < N; i++) {
+                            mCrcFile.writeInt(mInsertedCrcs.keyAt(i));
+                            mCrcFile.writeInt(mInsertedCrcs.valueAt(i));
+                            addedSize += ENTRY_SIZE;
+                        }
+                        mCrcFile.setLength(len + addedSize);
+                    }
+                }
+
+                mCrcFile.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        private void close() {
+            if (mCrcFile != null) {
+                try {
+                    mCrcFile.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+
+        private int getObscuredCrc(long crc) {
+            return (int)((crc & 0xFFFFFFFFL) + mObscureOffset);
+        }
     }
 }

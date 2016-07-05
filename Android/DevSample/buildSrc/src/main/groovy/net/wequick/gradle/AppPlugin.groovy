@@ -15,20 +15,32 @@
  */
 package net.wequick.gradle
 
+import com.android.build.api.transform.Format
+import com.android.build.gradle.api.BaseVariant
+import com.android.build.gradle.internal.pipeline.IntermediateFolderUtils
+import com.android.build.gradle.internal.pipeline.TransformTask
+import com.android.build.gradle.internal.transforms.ProGuardTransform
+import com.android.build.gradle.tasks.MergeManifests
+import com.android.build.gradle.tasks.ProcessAndroidResources
 import groovy.io.FileType
 import net.wequick.gradle.aapt.Aapt
 import net.wequick.gradle.aapt.SymbolParser
+import net.wequick.gradle.transform.StripAarTransform
 import net.wequick.gradle.util.JNIUtils
 import org.gradle.api.Project
+import org.gradle.api.Task
 import org.gradle.api.artifacts.ResolvedDependency
+import org.gradle.api.tasks.compile.JavaCompile
 
 class AppPlugin extends BundlePlugin {
 
-    private static def sPackageIds = [:] as LinkedHashMap<String, Integer>
     private static final int UNSET_TYPEID = 99
     private static final int UNSET_ENTRYID = -1
+    protected static def sPackageIds = [:] as LinkedHashMap<String, Integer>
 
     protected Set<Project> mDependentLibProjects
+    protected Set<File> mLibraryJars
+    protected File mMinifyJar
 
     void apply(Project project) {
         super.apply(project)
@@ -76,12 +88,11 @@ class AppPlugin extends BundlePlugin {
         if (!isBuildingRelease()) return
 
         project.afterEvaluate {
+            // Add custom transformation to split shared libraries
+            android.registerTransform(new StripAarTransform())
+
             initPackageId()
             resolveReleaseDependencies()
-
-            project.android.dexOptions {
-                preDexLibraries = false // !important, this makes classes.dex splitable
-            }
         }
     }
 
@@ -91,31 +102,38 @@ class AppPlugin extends BundlePlugin {
         return "$group-${project.version}.jar"
     }
 
-    protected void resolveReleaseDependencies() {
-        RootExtension rootExt = project.rootProject.small
+    protected Set<File> getLibraryJars() {
+        if (mLibraryJars != null) return mLibraryJars
 
-        // Pre-split shared libraries at release mode
-        //  - host, appcompat and etc.
-        def baseJars = project.fileTree(dir: rootExt.preBaseJarDir, include: ['*.jar'])
-        project.dependencies.add('provided', baseJars)
-        //  - lib.*
-        def libJarNames = []
+        mLibraryJars = new LinkedHashSet<File>()
+
+        // Collect the jars in `build-small/intermediates/small-pre-jar/base'
+        def baseJars = project.fileTree(dir: rootSmall.preBaseJarDir, include: ['*.jar'])
+        mLibraryJars.addAll(baseJars.files)
+
+        // Collect the jars of `compile project(lib.*)' with absolute file path, fix issue #65
+        Set<String> libJarNames = []
         mDependentLibProjects.each {
             libJarNames += getJarName(it)
         }
         if (libJarNames.size() > 0) {
-            // Collect the jars with absolute file path, fix issue #65
             def libJars = project.files(libJarNames.collect{
-                new File(rootExt.preLibsJarDir, it).path
+                new File(rootSmall.preLibsJarDir, it).path
             })
-            project.dependencies.add('provided', libJars)
+            mLibraryJars.addAll(libJars.files)
         }
 
+        return mLibraryJars
+    }
+
+    protected void resolveReleaseDependencies() {
         // Pre-split all the jar dependencies (deep level)
         def compile = project.configurations.compile
         compile.exclude group: 'com.android.support', module: 'support-annotations'
-        rootExt.preLinkJarDir.listFiles().each { file ->
+        rootSmall.preLinkJarDir.listFiles().each { file ->
             if (!file.name.endsWith('D.txt')) return
+            if (file.name.startsWith(project.name)) return
+
             file.eachLine { line ->
                 def module = line.split(':')
                 compile.exclude group: module[0], module: module[1]
@@ -130,38 +148,119 @@ class AppPlugin extends BundlePlugin {
         if (appcompat == null) {
             // Pre-split classes and resources.
             project.rootProject.small.preApDir.listFiles().each {
-                project.android.aaptOptions.additionalParameters '-I', it.path
+                android.aaptOptions.additionalParameters '-I', it.path
             }
             // Ensure generating text symbols - R.txt
             project.preBuild.doLast {
                 def symbolsPath = project.processReleaseResources.textSymbolOutputDir.path
-                project.android.aaptOptions.additionalParameters '--output-text-symbols',
+                android.aaptOptions.additionalParameters '--output-text-symbols',
                         symbolsPath
             }
         }
     }
 
     @Override
-    protected void configureReleaseVariant(variant) {
+    protected void configureDebugVariant(BaseVariant variant) {
+        super.configureDebugVariant(variant)
+
+        if (pluginType != PluginType.App) return
+
+        // If an app.A dependent by lib.B and both of them declare application@name in their
+        // manifests, the `processManifest` task will raise a conflict error. To avoid this,
+        // modify the lib.B manifest to remove the attributes before app.A `processManifest`
+        // and restore it after the task finished.
+        Task processDebugManifest = project.tasks["process${variant.name.capitalize()}Manifest"]
+        processDebugManifest.doFirst { MergeManifests it ->
+            def libs = it.libraries
+            def libManifests = []
+            libs.each {
+                if (it.name.contains(':lib.')) {
+                    libManifests.add(it.manifest)
+                }
+            }
+            def filteredManifests = []
+            libManifests.each { File manifest ->
+                def sb = new StringBuilder()
+                def enteredApplicationNode = false
+                def needsFilter = true
+                def filtered = false
+                manifest.eachLine { line ->
+                    if (!needsFilter && !filtered) return
+
+                    while (true) { // fake loop for less `if ... else' statement
+                        if (!needsFilter) break
+
+                        def i = line.indexOf('<application')
+                        if (i < 0) {
+                            if (!enteredApplicationNode) break
+
+                            if (line.indexOf('>') > 0) needsFilter = false
+
+                            // filter `android:name'
+                            if (line.indexOf('android:name') > 0) {
+                                filtered = true
+                                if (needsFilter) return
+
+                                line = '>'
+                            }
+                            break
+                        }
+
+                        def j = line.indexOf('<!--')
+                        if (j > 0 && j < i) break // ignores the comment line
+
+                        if (line.indexOf('>') > 0) { // <application /> or <application .. > in one line
+                            needsFilter = false
+                            def k = line.indexOf('android:name="')
+                            if (k > 0) {
+                                filtered = true
+                                def k_ = line.indexOf('"', k + 15) // bypass 'android:name='
+                                line = line.substring(0, k) + line.substring(k_ + 1)
+                            }
+                            break
+                        }
+
+                        enteredApplicationNode = true // mark this for next line
+                        break
+                    }
+
+                    sb.append(line).append(System.lineSeparator())
+                }
+
+                if (filtered) {
+                    def backupManifest = new File(manifest.parentFile, "${manifest.name}~")
+                    manifest.renameTo(backupManifest)
+                    manifest.write(sb.toString(), 'utf-8')
+                    filteredManifests.add(overwrite: manifest, backup: backupManifest)
+                }
+            }
+            ext.filteredManifests = filteredManifests
+        }
+        processDebugManifest.doLast {
+            ext.filteredManifests.each {
+                it.backup.renameTo(it.overwrite)
+            }
+        }
+    }
+
+    @Override
+    protected void configureReleaseVariant(BaseVariant variant) {
         super.configureReleaseVariant(variant)
 
         // Fill extensions
         def variantName = variant.name.capitalize()
-        def newDexTaskName = 'transformClassesWithDexFor' + variantName
-        def dexTask = project.hasProperty(newDexTaskName) ? project.tasks[newDexTaskName] : variant.dex
         File mergerDir = variant.mergeResources.incrementalFolder
 
         small.with {
             javac = variant.javaCompile
-            dex = dexTask
-            processManifest = project.tasks['process' + variantName + 'Manifest']
+            processManifest = project.tasks["process${variantName}Manifest"]
 
             packageName = variant.applicationId
             packagePath = packageName.replaceAll('\\.', '/')
             classesDir = javac.destinationDir
             bkClassesDir = new File(classesDir.parentFile, "${classesDir.name}~")
 
-            aapt = project.tasks['process' + variantName + 'Resources']
+            aapt = (ProcessAndroidResources) project.tasks["process${variantName}Resources"]
             apFile = aapt.packageOutputFile
 
             File symbolDir = aapt.textSymbolOutputDir
@@ -175,7 +274,66 @@ class AppPlugin extends BundlePlugin {
             mergerXml = new File(mergerDir, 'merger.xml')
         }
 
-        hookVariantTask()
+        hookVariantTask(variant)
+    }
+
+    @Override
+    protected void configureProguard(BaseVariant variant, TransformTask proguard, ProGuardTransform pt) {
+        super.configureProguard(variant, proguard, pt)
+
+        // Keep R.*
+        // FIXME: the `configuration' field is protected, may be depreciated
+        pt.configuration.keepAttributes = ['InnerClasses']
+        pt.keep("class ${variant.applicationId}.R")
+        pt.keep("class ${variant.applicationId}.R\$* { <fields>; }")
+
+        // Add reference libraries
+        proguard.doFirst {
+            getLibraryJars().each {
+                // FIXME: the `libraryJar' method is protected, may be depreciated
+                pt.libraryJar(it)
+            }
+        }
+        // Split R.class
+        proguard.doLast {
+            Log.success("[$project.name] Strip aar classes...")
+
+            if (small.splitRJavaFile == null) return
+
+            def minifyJar = IntermediateFolderUtils.getContentLocation(
+                    proguard.streamOutputFolder, 'main', pt.outputTypes, pt.scopes, Format.JAR)
+            if (!minifyJar.exists()) return
+
+            mMinifyJar = minifyJar // record for `LibraryPlugin'
+
+            // Unpack the minify jar to split the R.class
+            File unzipDir = new File(minifyJar.parentFile, 'main')
+            project.copy {
+                from project.zipTree(minifyJar)
+                into unzipDir
+            }
+
+            def javac = small.javac
+            File pkgDir = new File(unzipDir, small.packagePath)
+
+            // Delete the original generated R$xx.class
+            pkgDir.listFiles().each { f ->
+                if (f.name.startsWith('R$')) {
+                    f.delete()
+                }
+            }
+
+            // Re-compile the split R.java to R.class
+            project.ant.javac(srcdir: small.splitRJavaFile.parentFile,
+                    source: javac.sourceCompatibility,
+                    target: javac.targetCompatibility,
+                    destdir: unzipDir)
+
+            // Repack the minify jar
+            project.ant.zip(baseDir: unzipDir, destFile: minifyJar)
+
+            Log.success "[${project.name}] split R.class..."
+        }
     }
 
     /** Collect the vendor aars (has resources) compiling in current bundle */
@@ -243,14 +401,12 @@ class AppPlugin extends BundlePlugin {
         def idsFile = small.symbolFile
         if (!idsFile.exists()) return
 
-        RootExtension rootExt = project.rootProject.small
-
         // Check if has any vendor aars
         def firstLevelVendorAars = [] as Set<Map>
         def transitiveVendorAars = [] as Set<Map>
         collectVendorAars(firstLevelVendorAars, transitiveVendorAars)
         if (firstLevelVendorAars.size() > 0) {
-            if (rootExt.strictSplitResources) {
+            if (rootSmall.strictSplitResources) {
                 def err = new StringBuilder('In strict mode, we do not allow vendor aars, ')
                 err.append('please declare them in host build.gradle:\n')
                 firstLevelVendorAars.each {
@@ -269,7 +425,7 @@ class AppPlugin extends BundlePlugin {
 
         // Prepare id maps (bundle resource id -> library resource id)
         def libEntries = [:]
-        rootExt.preIdsDir.listFiles().each {
+        rootSmall.preIdsDir.listFiles().each {
             if (it.name.endsWith('R.txt') && !it.name.startsWith(project.name)) {
                 libEntries += SymbolParser.getResourceEntries(it)
             }
@@ -570,7 +726,7 @@ class AppPlugin extends BundlePlugin {
     protected int getABIFlag() {
         def abis = []
 
-        def jniDirs = project.android.sourceSets.main.jniLibs.srcDirs
+        def jniDirs = android.sourceSets.main.jniLibs.srcDirs
         if (jniDirs == null) jniDirs = []
         // Collect ABIs from AARs
         small.explodeAarDirs.each { dir ->
@@ -578,25 +734,42 @@ class AppPlugin extends BundlePlugin {
             if (!jniDir.exists()) return
             jniDirs.add(jniDir)
         }
+        def filters = android.defaultConfig.ndkConfig.abiFilters
         jniDirs.each { dir ->
-            dir.listFiles().each {
-                if (it.isDirectory() && !abis.contains(it.name)) {
-                    abis.add(it.name)
-                }
+            dir.listFiles().each { File d ->
+                if (d.isFile()) return
+
+                def abi = d.name
+                if (filters != null && !filters.contains(abi)) return
+                if (abis.contains(abi)) return
+
+                abis.add(abi)
             }
         }
 
         return JNIUtils.getABIFlag(abis)
     }
 
-    protected void hookVariantTask() {
-        RootExtension rootExt = project.rootProject.small
+    protected void hookVariantTask(BaseVariant variant) {
+        collectDependentAars()
 
-        // Hook preBuild task to resolve dependent AARs
+        hookProcessManifest(small.processManifest)
+
+        hookAapt(small.aapt)
+
+        hookJavac(small.javac, variant.buildType.minifyEnabled)
+
+        // Hook clean task to unset package id
+        project.clean.doLast {
+            sPackageIds.remove(project.name)
+        }
+    }
+
+    /** Hook preBuild task to resolve dependent AARs */
+    private def collectDependentAars() {
         project.preBuild.doFirst {
-            // Collect dependent AARs
             def smallLibAars = new HashSet() // the aars compiled in host or lib.*
-            rootExt.preLinkAarDir.listFiles().each { file ->
+            rootSmall.preLinkAarDir.listFiles().each { file ->
                 if (!file.name.endsWith('D.txt')) return
                 if (file.name.startsWith(project.name)) return
 
@@ -614,7 +787,8 @@ class AppPlugin extends BundlePlugin {
             project.rootProject.subprojects {
                 if (it.name.startsWith('lib.')) {
                     smallLibAars.add(group: it.group, name: it.name, version: it.version)
-                } else if (it.name != 'app' && it.name != 'small' && it.name.indexOf('.') < 0) {
+                } else if (it.name != rootSmall.hostModuleName
+                        && it.name != 'small' && it.name.indexOf('.') < 0) {
                     userLibAars.add(group: it.group, name: it.name, version: it.version)
                 }
             }
@@ -622,44 +796,93 @@ class AppPlugin extends BundlePlugin {
             small.splitAars = smallLibAars
             small.retainedAars = userLibAars
         }
+    }
 
+    private def hookProcessManifest(Task processManifest) {
+        // If an app.A dependent by lib.B and both of them declare application@name in their
+        // manifests, the `processManifest` task will raise an conflict error.
+        // Cause the release mode doesn't need to merge the manifest of lib.*, simply split
+        // out the manifest dependencies from them.
+        processManifest.doFirst { MergeManifests it ->
+            if (pluginType != PluginType.App) return
+
+            def libs = it.libraries
+            def smallLibs = []
+            libs.each {
+                if (it.name.contains(':lib.')) {
+                    smallLibs.add(it)
+                }
+            }
+            libs.removeAll(smallLibs)
+            it.libraries = libs
+        }
         // Hook process-manifest task to remove the `android:icon' and `android:label' attribute
-        // which declared in the plugin `AndroidManifest.xml' application node  (for #11)
-        small.processManifest.doLast {
+        // which declared in the plugin `AndroidManifest.xml' application node. (for #11)
+        processManifest.doLast { MergeManifests it ->
             File manifestFile = it.manifestOutputFile
             def sb = new StringBuilder()
             def enteredApplicationNode = false
             def needsFilter = true
+            def filterKeys = [
+                    'android:icon', 'android:label',
+                    'android:allowBackup', 'android:supportsRtl'
+            ]
+
+            // We don't use XmlParser but simply parse each line cause this should be faster
             manifestFile.eachLine { line ->
-                if (needsFilter) {
-                    if (line.indexOf('android:icon') > 0 || line.indexOf('android:label') > 0) {
-                        // After `processManifest' task, the xml file will be re-formatted and
-                        // the `android:icon' and `android:label' are placed in a single line.
-                        // So if we meet them, just ignored the whole line.
-                        return
-                    }
-                    if (line.indexOf('<application') > 0) {
-                        // To support plugin JNI, we overwrite the `android:label' attribute with
-                        // the ABIs flag here. So that at the runtime we can exactly extract the
-                        // usable JNIs in the supported ABI. (#87, #79)
-                        int flag = getABIFlag()
-                        if (flag != 0) {
-                            line += "\n        android:label=\"$flag\""
+                while (true) { // fake loop for less `if ... else' statement
+                    if (!needsFilter) break
+
+                    def i = line.indexOf('<application')
+                    if (i < 0) {
+                        if (!enteredApplicationNode) break
+
+                        int endPos = line.indexOf('>')
+                        if (endPos > 0) needsFilter = false
+
+                        // filter unused keys
+                        def filtered = false
+                        filterKeys.each {
+                            if (line.indexOf(it) > 0) {
+                                filtered = true
+                                return
+                            }
                         }
-                        enteredApplicationNode = true
+                        if (filtered) {
+                            if (needsFilter) return
+
+                            if (line.charAt(endPos - 1) == '/' as char) {
+                                line = '/>'
+                            } else {
+                                line = '>'
+                            }
+                        }
+                        break
                     }
-                    if (enteredApplicationNode && line.indexOf('>') > 0) {
+
+                    def j = line.indexOf('<!--')
+                    if (j > 0 && j < i) break // ignores the comment line
+
+                    if (line.indexOf('>') > 0) { // <application /> or <application .. > in one line
                         needsFilter = false
+                        break
                     }
+
+                    enteredApplicationNode = true // mark this for next line
+                    break
                 }
 
                 sb.append(line).append(System.lineSeparator())
             }
             manifestFile.write(sb.toString(), 'utf-8')
         }
+    }
 
-        // Hook aapt task to slice asset package and resolve library resource ids
-        small.aapt.doLast {
+    /**
+     * Hook aapt task to slice asset package and resolve library resource ids
+     */
+    private def hookAapt(ProcessAndroidResources aaptTask) {
+        aaptTask.doLast { ProcessAndroidResources it ->
             // Unpack resources.ap_
             File apFile = it.packageOutputFile
             File unzipApDir = new File(apFile.parentFile, 'ap_unzip')
@@ -674,7 +897,7 @@ class AppPlugin extends BundlePlugin {
                     new File(it.textSymbolOutputDir, 'R.txt') : null
             File sourceOutputDir = it.sourceOutputDir
             File rJavaFile = new File(sourceOutputDir, "${small.packagePath}/R.java")
-            def rev = project.android.buildToolsRevision
+            def rev = android.buildToolsRevision
             Aapt aapt = new Aapt(unzipApDir, rJavaFile, symbolFile, rev)
             if (small.retainedTypes != null) {
                 aapt.filterResources(small.retainedTypes)
@@ -684,6 +907,13 @@ class AppPlugin extends BundlePlugin {
                         small.retainedStyleables)
 
                 Log.success "[${project.name}] slice asset package and reset package id..."
+
+                int noResourcesFlag = (small.retainedTypes.size() == 0) ? 1 : 0
+                int abiFlag = getABIFlag()
+                int flags = (abiFlag << 1) | noResourcesFlag
+                if (aapt.writeSmallFlags(flags)) {
+                    Log.success "[${project.name}] add flags: ${Integer.toBinaryString(flags)}..."
+                }
 
                 String pkg = small.packageName
                 // Overwrite the aapt-generated R.java with full edition
@@ -723,14 +953,18 @@ class AppPlugin extends BundlePlugin {
             // Repack resources.ap_
             project.ant.zip(baseDir: unzipApDir, destFile: apFile)
         }
+    }
 
-        // Hook javac task to split libraries' R.class
-        small.javac.doFirst { t ->
+    /**
+     * Hook javac task to split libraries' R.class
+     */
+    private def hookJavac(Task javac, boolean minifyEnabled) {
+        javac.doFirst { JavaCompile it ->
             // Dynamically provided jars
-            def baseJars = project.fileTree(dir: rootExt.preBaseJarDir, include: ['*.jar'])
-            t.classpath += baseJars
+            it.classpath += project.files(getLibraryJars())
         }
-        small.javac.doLast {
+        javac.doLast { JavaCompile it ->
+            if (minifyEnabled) return // process later in proguard task
             if (!small.splitRJavaFile.exists()) return
 
             File classesDir = it.destinationDir
@@ -749,35 +983,6 @@ class AppPlugin extends BundlePlugin {
                     destdir: classesDir)
 
             Log.success "[${project.name}] split R.class..."
-        }
-
-        // Hook dex task to split all aar classes.jar
-        small.dex.doFirst {
-            small.bkAarDir.mkdir()
-            small.splitAars.each {
-                // TODO: Resolve the version conflict
-                String path = "${it.group}/${it.name}" // /${it.version}
-                File dir = new File(small.aarDir, path)
-                if (dir.exists()) {
-                    File todir = new File(small.bkAarDir, path)
-                    project.ant.move(file: dir, tofile: todir)
-                }
-            }
-            Log.success "[${project.name}] split aar classes..."
-        }
-
-        // Hook clean task to unset package id
-        project.clean.doLast {
-            sPackageIds.remove(project.name)
-        }
-    }
-
-    @Override
-    protected void tidyUp() {
-        super.tidyUp()
-        if (small.bkAarDir.exists()) {
-            project.ant.move(file: small.bkAarDir, tofile: small.aarDir)
-            small.bkAarDir.delete()
         }
     }
 

@@ -28,4 +28,5 @@ dependencies {
     // User libraries
     compile project(':lib.style')
     compile project(':lib.utils')
+    compile project(':lib.analytics')
 }

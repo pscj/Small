@@ -18,13 +18,12 @@ package net.wequick.small;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Message;
 
-import net.wequick.small.util.BundleParser;
 import net.wequick.small.util.FileUtils;
-import net.wequick.small.webkit.WebViewPool;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -32,17 +31,19 @@ import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.FileReader;
-import java.io.IOException;
 import java.io.InputStream;
+import java.io.PrintWriter;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * This class consists exclusively of methods that operate on apk plugin.
@@ -64,18 +65,24 @@ public class Bundle {
     //______________________________________________________________________________
     // Fields
     private static final String BUNDLE_MANIFEST_NAME = "bundle.json";
+    private static final String VERSION_KEY = "version";
     private static final String BUNDLES_KEY = "bundles";
     private static final String HOST_PACKAGE = "main";
 
+    private static final class Manifest {
+        String version;
+        List<Bundle> bundles;
+    }
+
     private static List<BundleLauncher> sBundleLaunchers = null;
     private static List<Bundle> sPreloadBundles = null;
+    private static List<Bundle> sUpdatingBundles = null;
     private static File sPatchManifestFile = null;
     private static String sUserBundlesPath = null;
     private static boolean sIs64bit = false;
 
     // Thread & Handler
     private static final int MSG_COMPLETE = 1;
-    private static final int MSG_INIT_WEBVIEW = 100;
     private static LoadBundleHandler sHandler;
     private static LoadBundleThread sThread;
 
@@ -94,6 +101,7 @@ public class Bundle {
 
     private File mBuiltinFile = null;
     private File mPatchFile = null;
+    private File mExtractPath;
 
     private boolean launchable = true;
     private boolean enabled = true;
@@ -120,16 +128,96 @@ public class Bundle {
      * @return
      */
     public static Bundle findByName(String name) {
+        Bundle bundle = findBundle(name, sPreloadBundles);
+        if (bundle != null) return bundle;
+        return findBundle(name, sUpdatingBundles);
+    }
+
+    private static Bundle findBundle(String name, List<Bundle> bundles) {
         if (name == null) return null;
-        if (sPreloadBundles == null) return null;
-        for (Bundle bundle : sPreloadBundles) {
+        if (bundles == null) return null;
+        for (Bundle bundle : bundles) {
             if (bundle.mPackageName == null) continue;
             if (bundle.mPackageName.equals(name)) return bundle;
         }
         return null;
     }
 
-    protected static boolean is64bit() {
+    /**
+     * Update bundle.json and apply settings
+     * @param data the manifest JSON object
+     * @param force <tt>true</tt> if force to update current bundles
+     * @return <tt>true</tt> if successfully updated
+     */
+    public static boolean updateManifest(JSONObject data, boolean force) {
+        if (data == null) return false;
+
+        Manifest manifest = parseManifest(data);
+        if (manifest == null) return false;
+
+        String manifestJson;
+        try {
+            manifestJson = data.toString(2);
+        } catch (JSONException e) {
+            e.printStackTrace();
+            return false;
+        }
+
+        if (force) {
+            // Save to file
+            File manifestFile = getPatchManifestFile();
+            try {
+                PrintWriter pw = new PrintWriter(new FileOutputStream(manifestFile));
+                pw.print(manifestJson);
+                pw.flush();
+                pw.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+                return false;
+            }
+            // Update bundles
+            for (Bundle bundle : manifest.bundles) {
+                Bundle preloadBundle = findBundle(bundle.getPackageName(), sPreloadBundles);
+                if (preloadBundle != null) {
+                    // Update bundle
+                    preloadBundle.uriString = bundle.uriString;
+                    preloadBundle.uri = bundle.uri;
+                    preloadBundle.rules = bundle.rules;
+                }
+            }
+        } else {
+            // Temporary add bundle
+            for (Bundle bundle : manifest.bundles) {
+                Bundle preloadBundle = findBundle(bundle.getPackageName(), sPreloadBundles);
+                if (preloadBundle == null) {
+                    if (sUpdatingBundles == null) {
+                        sUpdatingBundles = new ArrayList<Bundle>();
+                    }
+                    sUpdatingBundles.add(bundle);
+                }
+            }
+            // Save to `SharedPreference'
+            setCacheManifest(manifestJson);
+        }
+        return true;
+    }
+
+    private static String getCacheManifest() {
+        return Small.getSharedPreferences().getString(BUNDLE_MANIFEST_NAME, null);
+    }
+
+    private static void setCacheManifest(String text) {
+        SharedPreferences small = Small.getSharedPreferences();
+        SharedPreferences.Editor editor = small.edit();
+        if (text == null) {
+            editor.remove(BUNDLE_MANIFEST_NAME);
+        } else {
+            editor.putString(BUNDLE_MANIFEST_NAME, text);
+        }
+        editor.apply();
+    }
+
+    public static boolean is64bit() {
         return sIs64bit;
     }
 
@@ -160,11 +248,20 @@ public class Bundle {
     }
 
     private static void loadBundles(Context context) {
+        JSONObject manifestData;
         try {
-            // Read manifest file
-            String manifestJson;
             File patchManifestFile = getPatchManifestFile();
-            if (patchManifestFile.exists()) {
+            String manifestJson = getCacheManifest();
+            if (manifestJson != null) {
+                // Load from cache and save as patch
+                if (!patchManifestFile.exists()) patchManifestFile.createNewFile();
+                PrintWriter pw = new PrintWriter(new FileOutputStream(patchManifestFile));
+                pw.print(manifestJson);
+                pw.flush();
+                pw.close();
+                // Clear cache
+                setCacheManifest(null);
+            } else if (patchManifestFile.exists()) {
                 // Load from patch
                 BufferedReader br = new BufferedReader(new FileReader(patchManifestFile));
                 StringBuilder sb = new StringBuilder();
@@ -186,30 +283,54 @@ public class Bundle {
             }
 
             // Parse manifest file
-            JSONObject jsonObject = new JSONObject(manifestJson);
-            String version = jsonObject.getString("version");
-            loadManifest(version, jsonObject);
-        } catch (JSONException e) {
+            manifestData = new JSONObject(manifestJson);
+        } catch (Exception e) {
             e.printStackTrace();
-        } catch (FileNotFoundException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
-            e.printStackTrace();
+            return;
         }
+
+        Manifest manifest = parseManifest(manifestData);
+        if (manifest == null) return;
+
+        loadBundles(manifest.bundles);
     }
 
     protected static Boolean isLoadingAsync() {
         return (sThread != null);
     }
 
-    private static boolean loadManifest(String version, JSONObject jsonObject) {
+    private static Manifest parseManifest(JSONObject data) {
+        try {
+            String version = data.getString(VERSION_KEY);
+            return parseManifest(version, data);
+        } catch (JSONException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    private static Manifest parseManifest(String version, JSONObject data) {
         if (version.equals("1.0.0")) {
             try {
-                JSONArray bundles = jsonObject.getJSONArray(BUNDLES_KEY);
-                loadBundles(bundles);
-                return true;
+                JSONArray bundleDescs = data.getJSONArray(BUNDLES_KEY);
+                int N = bundleDescs.length();
+                List<Bundle> bundles = new ArrayList<Bundle>(N);
+                for (int i = 0; i < N; i++) {
+                    try {
+                        JSONObject object = bundleDescs.getJSONObject(i);
+                        Bundle bundle = new Bundle(object);
+                        bundles.add(bundle);
+                    } catch (JSONException e) {
+                        // Ignored
+                    }
+                }
+                Manifest manifest = new Manifest();
+                manifest.version = version;
+                manifest.bundles = bundles;
+                return manifest;
             } catch (JSONException e) {
-                return false;
+                e.printStackTrace();
+                return null;
             }
         }
 
@@ -327,6 +448,11 @@ public class Bundle {
     }
 
     private void initWithMap(JSONObject map) throws JSONException {
+        if (sUserBundlesPath == null) { // Lazy init
+            sUserBundlesPath = Small.getContext().getApplicationInfo().nativeLibraryDir;
+            sIs64bit = sUserBundlesPath.contains("64");
+        }
+
         String pkg = map.getString("pkg");
         if (pkg != null && !pkg.equals(HOST_PACKAGE)) {
             String soName = "lib" + pkg.replaceAll("\\.", "_") + ".so";
@@ -416,6 +542,14 @@ public class Bundle {
 
     public File getPatchFile() {
         return mPatchFile;
+    }
+
+    protected File getExtractPath() {
+        return mExtractPath;
+    }
+
+    protected void setExtractPath(File path) {
+        this.mExtractPath = path;
     }
 
     protected String getType() {
@@ -514,21 +648,9 @@ public class Bundle {
         }
     }
 
-    private static void loadBundles(JSONArray bundleDescs) {
-        // Init context
-        sUserBundlesPath = Small.getContext().getApplicationInfo().nativeLibraryDir;
-        sIs64bit = sUserBundlesPath.contains("64");
+    private static final int LOADING_TIMEOUT_MINUTES = 5;
 
-        List<Bundle> bundles = new ArrayList<Bundle>(bundleDescs.length());
-        for (int i = 0; i < bundleDescs.length(); i++) {
-            try {
-                JSONObject object = bundleDescs.getJSONObject(i);
-                Bundle bundle = new Bundle(object);
-                bundles.add(bundle);
-            } catch (JSONException e) {
-                // Ignored
-            }
-        }
+    private static void loadBundles(List<Bundle> bundles) {
         sPreloadBundles = bundles;
 
         // Prepare bundle
@@ -536,14 +658,52 @@ public class Bundle {
             bundle.prepareForLaunch();
         }
 
+        // Handle I/O
+        if (sIOActions != null) {
+            ExecutorService executor = Executors.newFixedThreadPool(sIOActions.size());
+            for (Runnable action : sIOActions) {
+                executor.execute(action);
+            }
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(LOADING_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
+                    throw new RuntimeException("Failed to load bundles! (TIMEOUT > "
+                            + LOADING_TIMEOUT_MINUTES + "minutes)");
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            sIOActions = null;
+        }
+
         // Notify `postSetUp' to all launchers
         for (BundleLauncher launcher : sBundleLaunchers) {
             launcher.postSetUp();
         }
+
+        // Free all unused temporary variables
+        for (Bundle bundle : bundles) {
+            if (bundle.parser != null) {
+                bundle.parser.close();
+                bundle.parser = null;
+            }
+            bundle.mBuiltinFile = null;
+            bundle.mExtractPath = null;
+        }
     }
 
-    protected static void postInitWebViewMessage(String url) {
-        sHandler.obtainMessage(MSG_INIT_WEBVIEW, url).sendToTarget();
+    private static List<Runnable> sIOActions;
+
+    protected static void postIO(Runnable action) {
+        if (sIOActions == null) {
+            sIOActions = new ArrayList<Runnable>();
+        }
+        sIOActions.add(action);
+    }
+
+    protected static void postUI(Runnable action) {
+        Message msg = Message.obtain(sHandler, action);
+        msg.sendToTarget();
     }
 
     private static class LoadBundleHandler extends Handler {
@@ -562,10 +722,6 @@ public class Bundle {
                     mListener = null;
                     sThread = null;
                     sHandler = null;
-                    break;
-                case MSG_INIT_WEBVIEW:
-                    String url = (String) msg.obj;
-                    WebViewPool.getInstance().alloc(url);
                     break;
             }
         }

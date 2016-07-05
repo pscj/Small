@@ -95,7 +95,7 @@ public abstract class BundleLauncher {
 
     /**
      * Called when Small is finish setUp by {@link Small#setUp}. This is where most completion
-     * should go: do something with the loaded bundles.
+     * should go: do something with the loaded bundles, free the memory of temporary variables.
      */
     public void postSetUp() { }
 
@@ -129,9 +129,9 @@ public abstract class BundleLauncher {
     }
 
     /**
-     * Called after {@link #preloadBundle(Bundle)} succeed. This is where most initialization
-     * should go: resolve the bundle activities or asset files,
-     * prepare the main entrance the bundle to start.
+     * Called after {@link #preloadBundle(Bundle)} succeed. This is where most I/O
+     * should go: parse the bundle file and resolve the bundle activities or asset files,
+     * prepare the main entrance of the bundle to start.
      *
      * @param bundle the loading bundle
      */

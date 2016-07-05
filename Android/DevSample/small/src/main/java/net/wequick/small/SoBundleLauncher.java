@@ -18,9 +18,6 @@ package net.wequick.small;
 import android.content.pm.PackageInfo;
 import android.util.Log;
 
-import net.wequick.small.util.BundleParser;
-import net.wequick.small.util.SignUtils;
-
 import java.io.File;
 
 /**
@@ -37,7 +34,7 @@ import java.io.File;
  *     <li>{@link WebBundleLauncher} resolve the native web bundle</li>
  * </ul>
  */
-public abstract class SoBundleLauncher extends BundleLauncher {
+public abstract class SoBundleLauncher extends BundleLauncher implements BundleExtractor {
 
     private static final String TAG = "SoBundle";
 
@@ -62,34 +59,64 @@ public abstract class SoBundleLauncher extends BundleLauncher {
         }
         if (!supporting) return false;
 
-        // Check if has builtin
+        // Initialize the extract path
+        File extractPath = getExtractPath(bundle);
+        if (extractPath != null) {
+            if (!extractPath.exists()) {
+                extractPath.mkdirs();
+            }
+            bundle.setExtractPath(extractPath);
+        }
+
+        // Select the bundle entry-point, `built-in' or `patch'
         File plugin = bundle.getBuiltinFile();
         BundleParser parser = BundleParser.parsePackage(plugin, packageName);
-        if (parser == null) return false; // required builtin
-
-        // Check if has a patch
         File patch = bundle.getPatchFile();
         BundleParser patchParser = BundleParser.parsePackage(patch, packageName);
-        if (patchParser != null) { // has
+        if (parser == null) {
+            if (patchParser == null) {
+                return false;
+            } else {
+                parser = patchParser; // use patch
+                plugin = patch;
+            }
+        } else if (patchParser != null) {
             if (patchParser.getPackageInfo().versionCode <= parser.getPackageInfo().versionCode) {
                 Log.d(TAG, "Patch file should be later than built-in!");
                 patch.delete();
             } else {
                 parser = patchParser; // use patch
+                plugin = patch;
             }
         }
         bundle.setParser(parser);
 
-        // Verify signatures
-        PackageInfo pluginInfo = parser.getPackageInfo();
-        if (!SignUtils.verifyPlugin(pluginInfo)) {
-            bundle.setEnabled(false);
-            return true; // Got it, but disabled
+        // Check if the plugin has not been modified
+        long lastModified = plugin.lastModified();
+        long savedLastModified = Small.getBundleLastModified(packageName);
+        if (savedLastModified != lastModified) {
+            // If modified, verify (and extract) each file entry for the bundle
+            if (!parser.verifyAndExtract(bundle, this)) {
+                bundle.setEnabled(false);
+                return true; // Got it, but disabled
+            }
+            Small.setBundleLastModified(packageName, lastModified);
         }
 
         // Record version code for upgrade
+        PackageInfo pluginInfo = parser.getPackageInfo();
         bundle.setVersionCode(pluginInfo.versionCode);
 
         return true;
+    }
+
+    @Override
+    public File getExtractPath(Bundle bundle) {
+        return null;
+    }
+
+    @Override
+    public File getExtractFile(Bundle bundle, String entryName) {
+        return null;
     }
 }

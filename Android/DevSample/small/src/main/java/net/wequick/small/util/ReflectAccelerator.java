@@ -23,12 +23,15 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.res.AssetManager;
+import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.util.DisplayMetrics;
 
 import java.io.File;
+import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
@@ -47,6 +50,7 @@ import dalvik.system.DexFile;
 public class ReflectAccelerator {
     // AssetManager.addAssetPath
     private static Method sAssetManager_addAssetPath_method;
+    private static Method sAssetManager_addAssetPaths_method;
     // ApplicationInfo.resourceDirs
     private static Field sContextImpl_mResources_field;
     // ActivityClientRecord
@@ -63,7 +67,9 @@ public class ReflectAccelerator {
         private static Field sDexClassLoader_mDexs_field;
         private static Field sPathClassLoader_libraryPathElements_field;
 
-        public static boolean expandDexPathList(ClassLoader cl, String dexPath, String optDexPath) {
+        public static boolean expandDexPathList(ClassLoader cl,
+                                                String[] dexPaths, DexFile[] dexFiles) {
+            ZipFile[] zips = null;
             try {
             /*
              * see https://android.googlesource.com/platform/libcore/+/android-2.3_r1/dalvik/src/main/java/dalvik/system/DexClassLoader.java
@@ -81,30 +87,48 @@ public class ReflectAccelerator {
                     return false;
                 }
 
-                File pathFile = new File(dexPath);
-                expandArray(cl, sDexClassLoader_mFiles_field, new Object[]{pathFile}, true);
+                int N = dexPaths.length;
+                Object[] files = new Object[N];
+                Object[] paths = new Object[N];
+                zips = new ZipFile[N];
+                for (int i = 0; i < N; i++) {
+                    String path = dexPaths[i];
+                    files[i] = new File(path);
+                    paths[i] = path;
+                    zips[i] = new ZipFile(path);
+                }
 
-                expandArray(cl, sDexClassLoader_mPaths_field, new Object[]{dexPath}, true);
-
-                ZipFile zipFile = new ZipFile(dexPath);
-                expandArray(cl, sDexClassLoader_mZips_field, new Object[]{zipFile}, true);
-
-                DexFile dexFile = DexFile.loadDex(dexPath, optDexPath, 0);
-                expandArray(cl, sDexClassLoader_mDexs_field, new Object[]{dexFile}, true);
+                expandArray(cl, sDexClassLoader_mFiles_field, files, true);
+                expandArray(cl, sDexClassLoader_mPaths_field, paths, true);
+                expandArray(cl, sDexClassLoader_mZips_field, zips, true);
+                expandArray(cl, sDexClassLoader_mDexs_field, dexFiles, true);
             } catch (Exception e) {
+                e.printStackTrace();
+                if (zips != null) {
+                    for (ZipFile zipFile : zips) {
+                        try {
+                            zipFile.close();
+                        } catch (IOException e1) {
+                            e1.printStackTrace();
+                        }
+                    }
+                }
                 return false;
             }
             return true;
         }
 
-        public static void expandNativeLibraryDirectories(ClassLoader classLoader, File libPath) {
+        public static void expandNativeLibraryDirectories(ClassLoader classLoader,
+                                                          List<File> libPaths) {
             if (sPathClassLoader_libraryPathElements_field == null) {
                 sPathClassLoader_libraryPathElements_field = getDeclaredField(
                         classLoader.getClass(), "libraryPathElements");
             }
             List<String> paths = getValue(sPathClassLoader_libraryPathElements_field, classLoader);
             if (paths == null) return;
-            paths.add(libPath.getAbsolutePath() + File.separator);
+            for (File libPath : libPaths) {
+                paths.add(libPath.getAbsolutePath() + File.separator);
+            }
         }
     }
 
@@ -116,12 +140,19 @@ public class ReflectAccelerator {
         private static Class sDexElementClass;
         private static Field sDexElementsField;
 
-        public static boolean expandDexPathList(ClassLoader cl, String dexPath, String optDexPath) {
+        public static boolean expandDexPathList(ClassLoader cl,
+                                                String[] dexPaths, DexFile[] dexFiles) {
             try {
-                File pkg = new File(dexPath);
-                DexFile dexFile = DexFile.loadDex(dexPath, optDexPath, 0);
-                Object element = makeDexElement(pkg, dexFile);
-                fillDexPathList(cl, element);
+                int N = dexPaths.length;
+                Object[] elements = new Object[N];
+                for (int i = 0; i < N; i++) {
+                    String dexPath = dexPaths[i];
+                    File pkg = new File(dexPath);
+                    DexFile dexFile = dexFiles[i];
+                    elements[i] = makeDexElement(pkg, dexFile);
+                }
+
+                fillDexPathList(cl, elements);
             } catch (Exception e) {
                 e.printStackTrace();
                 return false;
@@ -156,8 +187,18 @@ public class ReflectAccelerator {
                 case 3:
                     if (types[1].equals(ZipFile.class)) {
                         // Element(File apk, ZipFile zip, DexFile dex)
-                        ZipFile zip = new ZipFile(pkg);
-                        return sDexElementConstructor.newInstance(pkg, zip, dexFile);
+                        ZipFile zip;
+                        try {
+                            zip = new ZipFile(pkg);
+                        } catch (IOException e) {
+                            throw e;
+                        }
+                        try {
+                            return sDexElementConstructor.newInstance(pkg, zip, dexFile);
+                        } catch (Exception e) {
+                            zip.close();
+                            throw e;
+                        }
                     } else {
                         // Element(File apk, File zip, DexFile dex)
                         return sDexElementConstructor.newInstance(pkg, pkg, dexFile);
@@ -173,7 +214,7 @@ public class ReflectAccelerator {
             }
         }
 
-        private static void fillDexPathList(ClassLoader cl, Object element)
+        private static void fillDexPathList(ClassLoader cl, Object[] elements)
                 throws NoSuchFieldException, IllegalAccessException {
             if (sPathListField == null) {
                 sPathListField = getDeclaredField(DexClassLoader.class.getSuperclass(), "pathList");
@@ -182,7 +223,7 @@ public class ReflectAccelerator {
             if (sDexElementsField == null) {
                 sDexElementsField = getDeclaredField(pathList.getClass(), "dexElements");
             }
-            expandArray(pathList, sDexElementsField, new Object[]{element}, true);
+            expandArray(pathList, sDexElementsField, elements, true);
         }
 
         public static void removeDexPathList(ClassLoader cl, int deleteIndex) {
@@ -274,7 +315,8 @@ public class ReflectAccelerator {
 
         protected static Field sDexPathList_nativeLibraryDirectories_field;
 
-        public static void expandNativeLibraryDirectories(ClassLoader classLoader, File libPath) {
+        public static void expandNativeLibraryDirectories(ClassLoader classLoader,
+                                                          List<File> libPaths) {
             if (sPathListField == null) return;
 
             Object pathList = getValue(sPathListField, classLoader);
@@ -288,7 +330,7 @@ public class ReflectAccelerator {
 
             try {
                 // File[] nativeLibraryDirectories
-                File[] paths = new File[]{libPath};
+                Object[] paths = libPaths.toArray();
                 expandArray(pathList, sDexPathList_nativeLibraryDirectories_field, paths, false);
             } catch (Exception e) {
                 e.printStackTrace();
@@ -300,7 +342,8 @@ public class ReflectAccelerator {
 
         private static Field sDexPathList_nativeLibraryPathElements_field;
 
-        public static void expandNativeLibraryDirectories(ClassLoader classLoader, File libPath) {
+        public static void expandNativeLibraryDirectories(ClassLoader classLoader,
+                                                          List<File> libPaths) {
             if (sPathListField == null) return;
 
             Object pathList = getValue(sPathListField, classLoader);
@@ -316,7 +359,7 @@ public class ReflectAccelerator {
                 // List<File> nativeLibraryDirectories
                 List<File> paths = getValue(sDexPathList_nativeLibraryDirectories_field, pathList);
                 if (paths == null) return;
-                paths.add(libPath);
+                paths.addAll(libPaths);
 
                 // Element[] nativeLibraryPathElements
                 if (sDexPathList_nativeLibraryPathElements_field == null) {
@@ -325,9 +368,14 @@ public class ReflectAccelerator {
                 }
                 if (sDexPathList_nativeLibraryPathElements_field == null) return;
 
-                Object dexElement = makeDexElement(libPath);
-                expandArray(pathList, sDexPathList_nativeLibraryPathElements_field,
-                        new Object[]{dexElement}, false);
+                int N = libPaths.size();
+                Object[] elements = new Object[N];
+                for (int i = 0; i < N; i++) {
+                    Object dexElement = makeDexElement(libPaths.get(i));
+                    elements[i] = dexElement;
+                }
+
+                expandArray(pathList, sDexPathList_nativeLibraryPathElements_field, elements, false);
             } catch (Exception e) {
                 e.printStackTrace();
             }
@@ -362,15 +410,36 @@ public class ReflectAccelerator {
         return ret;
     }
 
-    public static boolean expandDexPathList(ClassLoader cl, String dexPath, String optDexPath) {
+    public static int[] addAssetPaths(AssetManager assets, String[] paths) {
+        if (sAssetManager_addAssetPaths_method == null) {
+            sAssetManager_addAssetPaths_method = getMethod(AssetManager.class,
+                    "addAssetPaths", new Class[]{String[].class});
+        }
+        if (sAssetManager_addAssetPaths_method == null) return null;
+        return invoke(sAssetManager_addAssetPaths_method, assets, new Object[]{paths});
+    }
+
+    public static Resources newResources(Class resourcesClass, AssetManager assets,
+                                         DisplayMetrics metrics, Configuration configuration) {
+        try {
+            Constructor c = resourcesClass.getConstructor(
+                    AssetManager.class, DisplayMetrics.class, Configuration.class);
+            return (Resources) c.newInstance(assets, metrics, configuration);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    public static boolean expandDexPathList(ClassLoader cl, String[] dexPaths, DexFile[] dexFiles) {
         if (Build.VERSION.SDK_INT < 14) {
-            return V9_13.expandDexPathList(cl, dexPath, optDexPath);
+            return V9_13.expandDexPathList(cl, dexPaths, dexFiles);
         } else {
-            return V14_.expandDexPathList(cl, dexPath, optDexPath);
+            return V14_.expandDexPathList(cl, dexPaths, dexFiles);
         }
     }
 
-    public static void expandNativeLibraryDirectories(ClassLoader classLoader, File libPath) {
+    public static void expandNativeLibraryDirectories(ClassLoader classLoader, List<File> libPath) {
         int v = Build.VERSION.SDK_INT;
         if (v < 14) {
             V9_13.expandNativeLibraryDirectories(classLoader, libPath);

@@ -16,11 +16,10 @@
 package net.wequick.gradle
 
 import org.gradle.api.Project
+import org.gradle.util.VersionNumber
 
 public class RootExtension extends BaseExtension {
 
-    private static final String PLUGIN_GROUP = 'net.wequick.tools.build'
-    private static final String PLUGIN_MODULE = 'gradle-small'
     private static final String FD_BUILD_SMALL = 'build-small'
     private static final String FD_PRE_JAR = 'small-pre-jar'
     private static final String FD_PRE_AP = 'small-pre-ap'
@@ -31,11 +30,24 @@ public class RootExtension extends BaseExtension {
     private static final String FD_JAR = 'jar'
     private static final String FD_AAR = 'aar'
 
+    /** The minimum small aar version required */
+    private static final String REQUIRED_AAR_VERSION = '1.0.0'
+    private static final VersionNumber REQUIRED_AAR_REVISION = VersionNumber.parse(REQUIRED_AAR_VERSION)
+
     /** 
      * Version of aar net.wequick.small:small
      * default to `gradle-small' plugin version 
      */
     String aarVersion
+
+    /**
+     * Host module name
+     * default to `app'
+     */
+    String hostModuleName
+
+    /** The parsed revision of `aarVersion' */
+    private VersionNumber aarRevision
 
     /**
      * Strict mode, <tt>true</tt> if keep only resources in bundle's res directory.
@@ -48,8 +60,11 @@ public class RootExtension extends BaseExtension {
     /** Count of bundles */
     protected int bundleCount
 
-    /** Whether contains project small */
-    protected boolean hasSmallProject
+    /** Project of Small AAR module */
+    protected Project smallProject
+
+    /** Project of host */
+    protected Project hostProject
 
     /** Directory to output bundles (*.so) */
     protected File outputBundleDir
@@ -75,6 +90,8 @@ public class RootExtension extends BaseExtension {
     RootExtension(Project project) {
         super(project)
 
+        hostModuleName = 'app'
+
         preBuildDir = new File(project.projectDir, FD_BUILD_SMALL)
         def interDir = new File(preBuildDir, FD_INTERMEDIATES)
         def jarDir = new File(interDir, FD_PRE_JAR)
@@ -85,12 +102,6 @@ public class RootExtension extends BaseExtension {
         def preLinkDir = new File(interDir, FD_PRE_LINK)
         preLinkJarDir = new File(preLinkDir, FD_JAR)
         preLinkAarDir = new File(preLinkDir, FD_AAR)
-
-        def pluginModule = project.buildscript.configurations.classpath.
-                resolvedConfiguration.firstLevelModuleDependencies.find {
-            it.moduleGroup == PLUGIN_GROUP && it.moduleName == PLUGIN_MODULE
-        }
-        if (pluginModule != null) aarVersion = pluginModule.moduleVersion
     }
 
     public File getPreBuildDir() {
@@ -119,5 +130,28 @@ public class RootExtension extends BaseExtension {
 
     public File getPreLinkAarDir() {
         return preLinkAarDir
+    }
+
+    public String getAarVersion() {
+        if (aarVersion == null) {
+            throw new RuntimeException(
+                    'Please specify Small aar version in your root build.gradle:\n' +
+                            "small {\n    aarVersion = '[the_version]'\n}")
+        }
+
+        if (aarRevision == null) {
+            synchronized (this.class) {
+                if (aarRevision == null) {
+                    aarRevision = VersionNumber.parse(aarVersion)
+                }
+            }
+        }
+        if (aarRevision < REQUIRED_AAR_REVISION) {
+            throw new RuntimeException(
+                    "Small aar version $REQUIRED_AAR_VERSION is required. Current version is $aarVersion"
+            )
+        }
+
+        return aarVersion
     }
 }

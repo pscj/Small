@@ -102,7 +102,15 @@ public class Bundle {
     private String entrance = null; // Main activity for `apk bundle', index page for `web bundle'
 
     private BundleParser parser;
+    private android.os.Bundle intentData;
 
+    public android.os.Bundle getIntentData() {
+        return intentData;
+    }
+
+    public void setIntentData(android.os.Bundle intentData) {
+        this.intentData = intentData;
+    }
     //______________________________________________________________________________
     // Class methods
 

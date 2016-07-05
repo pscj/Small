@@ -448,6 +448,8 @@ public class ApkBundleLauncher extends SoBundleLauncher {
     public void prelaunchBundle(Bundle bundle) {
         super.prelaunchBundle(bundle);
         Intent intent = new Intent();
+        if( bundle.getIntentData() != null)
+            intent.putExtras(bundle.getIntentData());
         bundle.setIntent(intent);
 
         // Intent extras - class

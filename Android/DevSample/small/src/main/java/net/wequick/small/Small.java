@@ -224,6 +224,26 @@ public final class Small {
             bundle.launchFrom(context);
         }
     }
+    public static void openUri(String uriString, Context context, android.os.Bundle data) {
+        // System url schemes
+        Uri uri = makeUri(uriString);
+        String scheme = uri.getScheme();
+        if (scheme != null
+                && !scheme.equals("http")
+                && !scheme.equals("https")
+                && !scheme.equals("file")
+                && ApplicationUtils.canOpenUri(uri, context)) {
+            ApplicationUtils.openUri(uri, context);
+            return;
+        }
+
+        // Small url schemes
+        Bundle bundle = Bundle.getLaunchableBundle(uri);
+        if (bundle != null) {
+            bundle.setIntentData(data);
+            bundle.launchFrom(context);
+        }
+    }
 
     public static Intent getIntentOfUri(String uriString, Context context) {
         return getIntentOfUri(makeUri(uriString), context);
